@@ -62,7 +62,6 @@
 from __future__ import absolute_import, division, print_function, \
     with_statement
 
-import time
 import socket
 import logging
 import struct
@@ -82,7 +81,7 @@ def client_key(source_addr, server_af):
 
 
 class UDPRelay(object):
-    def __init__(self, config, dns_resolver, is_local):
+    def __init__(self, config, dns_resolver, is_local, stat_callback=None):
         self._config = config
         if is_local:
             self._listen_addr = config['local_address']
@@ -95,7 +94,7 @@ class UDPRelay(object):
             self._remote_addr = None
             self._remote_port = None
         self._dns_resolver = dns_resolver
-        self._password = config['password']
+        self._password = common.to_bytes(config['password'])
         self._method = config['method']
         self._timeout = config['timeout']
         self._is_local = is_local
@@ -106,7 +105,6 @@ class UDPRelay(object):
         self._dns_cache = lru_cache.LRUCache(timeout=300)
         self._eventloop = None
         self._closed = False
-        self._last_time = time.time()
         self._sockets = set()
         if 'forbidden_ip' in config:
             self._forbidden_iplist = config['forbidden_ip']
@@ -123,6 +121,7 @@ class UDPRelay(object):
         server_socket.bind((self._listen_addr, self._listen_port))
         server_socket.setblocking(False)
         self._server_socket = server_socket
+        self._stat_callback = stat_callback
 
     def _get_a_server(self):
         server = self._config['server']
@@ -148,6 +147,8 @@ class UDPRelay(object):
         data, r_addr = server.recvfrom(BUF_SIZE)
         if not data:
             logging.debug('UDP handle_server: data is empty')
+        if self._stat_callback:
+            self._stat_callback(self._listen_port, len(data))
         if self._is_local:
             frag = common.ord(data[2])
             if frag != 0:
@@ -183,7 +184,6 @@ class UDPRelay(object):
 
         af, socktype, proto, canonname, sa = addrs[0]
         key = client_key(r_addr, af)
-        logging.debug(key)
         client = self._cache.get(key, None)
         if not client:
             # TODO async getaddrinfo
@@ -199,7 +199,7 @@ class UDPRelay(object):
             self._client_fd_to_server_addr[client.fileno()] = r_addr
 
             self._sockets.add(client.fileno())
-            self._eventloop.add(client, eventloop.POLL_IN)
+            self._eventloop.add(client, eventloop.POLL_IN, self)
 
         if self._is_local:
             data = encrypt.encrypt_all(self._password, self._method, 1, data)
@@ -223,6 +223,8 @@ class UDPRelay(object):
         if not data:
             logging.debug('UDP handle_client: data is empty')
             return
+        if self._stat_callback:
+            self._stat_callback(self._listen_port, len(data))
         if not self._is_local:
             addrlen = len(r_addr[0])
             if addrlen > 255:
@@ -257,34 +259,40 @@ class UDPRelay(object):
         if self._closed:
             raise Exception('already closed')
         self._eventloop = loop
-        loop.add_handler(self._handle_events)
 
         server_socket = self._server_socket
         self._eventloop.add(server_socket,
-                            eventloop.POLL_IN | eventloop.POLL_ERR)
+                            eventloop.POLL_IN | eventloop.POLL_ERR, self)
+        loop.add_periodic(self.handle_periodic)
 
-    def _handle_events(self, events):
-        for sock, fd, event in events:
-            if sock == self._server_socket:
-                if event & eventloop.POLL_ERR:
-                    logging.error('UDP server_socket err')
-                self._handle_server()
-            elif sock and (fd in self._sockets):
-                if event & eventloop.POLL_ERR:
-                    logging.error('UDP client_socket err')
-                self._handle_client(sock)
-        now = time.time()
-        if now - self._last_time > 3:
-            self._cache.sweep()
-            self._client_fd_to_server_addr.sweep()
-            self._last_time = now
+    def handle_event(self, sock, fd, event):
+        if sock == self._server_socket:
+            if event & eventloop.POLL_ERR:
+                logging.error('UDP server_socket err')
+            self._handle_server()
+        elif sock and (fd in self._sockets):
+            if event & eventloop.POLL_ERR:
+                logging.error('UDP client_socket err')
+            self._handle_client(sock)
+
+    def handle_periodic(self):
         if self._closed:
-            self._server_socket.close()
-            for sock in self._sockets:
-                sock.close()
-            self._eventloop.remove_handler(self._handle_events)
+            if self._server_socket:
+                self._server_socket.close()
+                self._server_socket = None
+                for sock in self._sockets:
+                    sock.close()
+                logging.info('closed UDP port %d', self._listen_port)
+        self._cache.sweep()
+        self._client_fd_to_server_addr.sweep()
 
     def close(self, next_tick=False):
+        logging.debug('UDP close')
         self._closed = True
         if not next_tick:
+            if self._eventloop:
+                self._eventloop.remove_periodic(self.handle_periodic)
+                self._eventloop.remove(self._server_socket)
             self._server_socket.close()
+            for client in list(self._cache.values()):
+                client.close()

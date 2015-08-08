@@ -32,9 +32,6 @@ from shadowsocks.common import parse_header
 # we clear at most TIMEOUTS_CLEAN_SIZE timeouts each time
 TIMEOUTS_CLEAN_SIZE = 512
 
-# we check timeouts every TIMEOUT_PRECISION seconds
-TIMEOUT_PRECISION = 4
-
 MSG_FASTOPEN = 0x20000000
 
 # SOCKS command definition
@@ -126,7 +123,8 @@ class TCPRelayHandler(object):
         fd_to_handlers[local_sock.fileno()] = self
         local_sock.setblocking(False)
         local_sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
-        loop.add(local_sock, eventloop.POLL_IN | eventloop.POLL_ERR)
+        loop.add(local_sock, eventloop.POLL_IN | eventloop.POLL_ERR,
+                 self._server)
         self.last_activity = 0
         self._update_activity()
 
@@ -149,10 +147,10 @@ class TCPRelayHandler(object):
         logging.debug('chosen server: %s:%d', server, server_port)
         return server, server_port
 
-    def _update_activity(self):
+    def _update_activity(self, data_len=0):
         # tell the TCP Relay we have activities recently
         # else it will think we are inactive and timed out
-        self._server.update_activity(self)
+        self._server.update_activity(self, data_len)
 
     def _update_stream(self, stream, status):
         # update a stream to a new waiting status
@@ -238,7 +236,7 @@ class TCPRelayHandler(object):
                 remote_sock = \
                     self._create_remote_socket(self._chosen_server[0],
                                                self._chosen_server[1])
-                self._loop.add(remote_sock, eventloop.POLL_ERR)
+                self._loop.add(remote_sock, eventloop.POLL_ERR, self._server)
                 data = b''.join(self._data_to_write_to_remote)
                 l = len(data)
                 s = remote_sock.sendto(data, MSG_FASTOPEN, self._chosen_server)
@@ -319,7 +317,6 @@ class TCPRelayHandler(object):
             self._log_error(e)
             if self._config['verbose']:
                 traceback.print_exc()
-            # TODO use logging when debug completed
             self.destroy()
 
     def _create_remote_socket(self, ip, port):
@@ -375,7 +372,8 @@ class TCPRelayHandler(object):
                                     errno.EINPROGRESS:
                                 pass
                         self._loop.add(remote_sock,
-                                       eventloop.POLL_ERR | eventloop.POLL_OUT)
+                                       eventloop.POLL_ERR | eventloop.POLL_OUT,
+                                       self._server)
                         self._stage = STAGE_CONNECTING
                         self._update_stream(STREAM_UP, WAIT_STATUS_READWRITING)
                         self._update_stream(STREAM_DOWN, WAIT_STATUS_READING)
@@ -389,7 +387,6 @@ class TCPRelayHandler(object):
     def _on_local_read(self):
         # handle all local read events and dispatch them to methods for
         # each stage
-        self._update_activity()
         if not self._local_sock:
             return
         is_local = self._is_local
@@ -403,6 +400,7 @@ class TCPRelayHandler(object):
         if not data:
             self.destroy()
             return
+        self._update_activity(len(data))
         if not is_local:
             data = self._encryptor.decrypt(data)
             if not data:
@@ -425,10 +423,10 @@ class TCPRelayHandler(object):
 
     def _on_remote_read(self):
         # handle all remote read events
-        self._update_activity()
         data = None
         try:
             data = self._remote_sock.recv(BUF_SIZE)
+
         except (OSError, IOError) as e:
             if eventloop.errno_from_exception(e) in \
                     (errno.ETIMEDOUT, errno.EAGAIN, errno.EWOULDBLOCK):
@@ -436,6 +434,7 @@ class TCPRelayHandler(object):
         if not data:
             self.destroy()
             return
+        self._update_activity(len(data))
         if self._is_local:
             data = self._encryptor.decrypt(data)
         else:
@@ -550,14 +549,13 @@ class TCPRelayHandler(object):
 
 
 class TCPRelay(object):
-    def __init__(self, config, dns_resolver, is_local):
+    def __init__(self, config, dns_resolver, is_local, stat_callback=None):
         self._config = config
         self._is_local = is_local
         self._dns_resolver = dns_resolver
         self._closed = False
         self._eventloop = None
         self._fd_to_handlers = {}
-        self._last_time = time.time()
 
         self._timeout = config['timeout']
         self._timeouts = []  # a list for all the handlers
@@ -591,6 +589,7 @@ class TCPRelay(object):
                 self._config['fast_open'] = False
         server_socket.listen(1024)
         self._server_socket = server_socket
+        self._stat_callback = stat_callback
 
     def add_to_loop(self, loop):
         if self._eventloop:
@@ -598,10 +597,9 @@ class TCPRelay(object):
         if self._closed:
             raise Exception('already closed')
         self._eventloop = loop
-        loop.add_handler(self._handle_events)
-
         self._eventloop.add(self._server_socket,
-                            eventloop.POLL_IN | eventloop.POLL_ERR)
+                            eventloop.POLL_IN | eventloop.POLL_ERR, self)
+        self._eventloop.add_periodic(self.handle_periodic)
 
     def remove_handler(self, handler):
         index = self._handler_to_timeouts.get(hash(handler), -1)
@@ -610,10 +608,13 @@ class TCPRelay(object):
             self._timeouts[index] = None
             del self._handler_to_timeouts[hash(handler)]
 
-    def update_activity(self, handler):
+    def update_activity(self, handler, data_len):
+        if data_len and self._stat_callback:
+            self._stat_callback(self._listen_port, data_len)
+
         # set handler to active
         now = int(time.time())
-        if now - handler.last_activity < TIMEOUT_PRECISION:
+        if now - handler.last_activity < eventloop.TIMEOUT_PRECISION:
             # thus we can lower timeout modification frequency
             return
         handler.last_activity = now
@@ -659,54 +660,57 @@ class TCPRelay(object):
                 pos = 0
             self._timeout_offset = pos
 
-    def _handle_events(self, events):
+    def handle_event(self, sock, fd, event):
         # handle events and dispatch to handlers
-        for sock, fd, event in events:
-            if sock:
-                logging.log(shell.VERBOSE_LEVEL, 'fd %d %s', fd,
-                            eventloop.EVENT_NAMES.get(event, event))
-            if sock == self._server_socket:
-                if event & eventloop.POLL_ERR:
-                    # TODO
-                    raise Exception('server_socket error')
-                try:
-                    logging.debug('accept')
-                    conn = self._server_socket.accept()
-                    TCPRelayHandler(self, self._fd_to_handlers,
-                                    self._eventloop, conn[0], self._config,
-                                    self._dns_resolver, self._is_local)
-                except (OSError, IOError) as e:
-                    error_no = eventloop.errno_from_exception(e)
-                    if error_no in (errno.EAGAIN, errno.EINPROGRESS,
-                                    errno.EWOULDBLOCK):
-                        continue
-                    else:
-                        shell.print_exception(e)
-                        if self._config['verbose']:
-                            traceback.print_exc()
-            else:
-                if sock:
-                    handler = self._fd_to_handlers.get(fd, None)
-                    if handler:
-                        handler.handle_event(sock, event)
+        if sock:
+            logging.log(shell.VERBOSE_LEVEL, 'fd %d %s', fd,
+                        eventloop.EVENT_NAMES.get(event, event))
+        if sock == self._server_socket:
+            if event & eventloop.POLL_ERR:
+                # TODO
+                raise Exception('server_socket error')
+            try:
+                logging.debug('accept')
+                conn = self._server_socket.accept()
+                TCPRelayHandler(self, self._fd_to_handlers,
+                                self._eventloop, conn[0], self._config,
+                                self._dns_resolver, self._is_local)
+            except (OSError, IOError) as e:
+                error_no = eventloop.errno_from_exception(e)
+                if error_no in (errno.EAGAIN, errno.EINPROGRESS,
+                                errno.EWOULDBLOCK):
+                    return
                 else:
-                    logging.warn('poll removed fd')
+                    shell.print_exception(e)
+                    if self._config['verbose']:
+                        traceback.print_exc()
+        else:
+            if sock:
+                handler = self._fd_to_handlers.get(fd, None)
+                if handler:
+                    handler.handle_event(sock, event)
+            else:
+                logging.warn('poll removed fd')
 
-        now = time.time()
-        if now - self._last_time > TIMEOUT_PRECISION:
-            self._sweep_timeout()
-            self._last_time = now
+    def handle_periodic(self):
         if self._closed:
             if self._server_socket:
                 self._eventloop.remove(self._server_socket)
                 self._server_socket.close()
                 self._server_socket = None
-                logging.info('closed listen port %d', self._listen_port)
+                logging.info('closed TCP port %d', self._listen_port)
             if not self._fd_to_handlers:
-                self._eventloop.remove_handler(self._handle_events)
+                logging.info('stopping')
+                self._eventloop.stop()
+        self._sweep_timeout()
 
     def close(self, next_tick=False):
+        logging.debug('TCP close')
         self._closed = True
         if not next_tick:
+            if self._eventloop:
+                self._eventloop.remove_periodic(self.handle_periodic)
+                self._eventloop.remove(self._server_socket)
             self._server_socket.close()
-            self._server_socket = None
+            for handler in list(self._fd_to_handlers.values()):
+                handler.destroy()
