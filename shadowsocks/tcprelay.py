@@ -563,6 +563,8 @@ class TCPRelay(object):
         self._timeout_offset = 0   # last checked position for timeout
         self._handler_to_timeouts = {}  # key: handler value: index in timeouts
 
+        #if no port specified in configure, will use a random free port
+        listen_port = 0
         if is_local:
             listen_addr = config['local_address']
             listen_port = config['local_port']
@@ -576,6 +578,7 @@ class TCPRelay(object):
         if len(addrs) == 0:
             raise Exception("can't get addrinfo for %s:%d" %
                             (listen_addr, listen_port))
+
         af, socktype, proto, canonname, sa = addrs[0]
         server_socket = socket.socket(af, socktype, proto)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -587,9 +590,12 @@ class TCPRelay(object):
             except socket.error:
                 logging.error('warning: fast open is not available')
                 self._config['fast_open'] = False
+
         server_socket.listen(1024)
+        self._listen_port = server_socket.getsockname()[1]
         self._server_socket = server_socket
         self._stat_callback = stat_callback
+        logging.info("listening on %s:%d"%(listen_addr,self._listen_port))
 
     def add_to_loop(self, loop):
         if self._eventloop:
@@ -705,7 +711,7 @@ class TCPRelay(object):
         self._sweep_timeout()
 
     def close(self, next_tick=False):
-        logging.debug('TCP close')
+        logging.debug('closing port %d'%self._listen_port)
         self._closed = True
         if not next_tick:
             if self._eventloop:

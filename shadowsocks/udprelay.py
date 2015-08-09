@@ -287,7 +287,7 @@ class UDPRelay(object):
         self._client_fd_to_server_addr.sweep()
 
     def close(self, next_tick=False):
-        logging.debug('UDP close')
+        logging.debug('closing port %d'%self._listen_port)
         self._closed = True
         if not next_tick:
             if self._eventloop:

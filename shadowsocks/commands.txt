@@ -1,0 +1,7 @@
+PUBLISH ss-server-command '{"id":123,"action":"start","port":0,"password":"test1"}'
+PUBLISH ss-server-command '{"id":124,"action":"start","port":123,"password":"test1"}'
+PUBLISH ss-server-command '{"id":125,"action":"stop","port":0}'
+PUBLISH ss-server-command '{"id":125,"action":"stop","port":123}'
+PUBLISH ss-server-command '{"id":126,"action":"restart","port":0}'
+PUBLISH ss-server-command '{"id":126,"action":"restart","port":123,"password":"test1"}'
+PUBLISH ss-server-command '{"id":127,"action":"exit"}'

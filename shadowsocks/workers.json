@@ -1,0 +1,18 @@
+{
+    "server":"127.0.0.1",
+    "local_port":1081,
+    "port_password":{
+        "7582": "aes_password",
+        "7583": "aes_password"
+    },
+    "timeout":60,
+    "method":"aes-256-cfb",
+    "fast_open":true,
+    "workers": 4,
+
+    "redis_host": "127.0.0.1",
+    "redis_port": 6379,
+    "redis_password": "",
+    "redis_database": 0,
+    "redis_command_channel": "ss-server-command"
+}
